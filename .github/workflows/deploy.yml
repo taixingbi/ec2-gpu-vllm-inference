@@ -79,21 +79,37 @@ jobs:
           EIP_TAG="ec2-gpu-vllm-eip"
 
           echo "Looking for running instance with tag Name=$INSTANCE_NAME..."
-          EXISTING=$(aws ec2 describe-instances \
+          EXISTING_ID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running" \
-            --query 'Reservations[*].Instances[0].[InstanceId,PublicIpAddress]' \
-            --output text 2>/dev/null | head -1)
+            --query 'Reservations[0].Instances[0].InstanceId' \
+            --output text 2>/dev/null || true)
 
-          if [ -n "$EXISTING" ]; then
-            EXISTING_IP=$(echo "$EXISTING" | awk '{print $2}')
-            if [ -n "$EXISTING_IP" ] && [ "$EXISTING_IP" != "None" ]; then
-              echo "Found existing instance: $EXISTING_IP"
-              echo "host=$EXISTING_IP" >> "$GITHUB_OUTPUT"
-              exit 0
+          if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "None" ]; then
+            ROOT_VOL=$(aws ec2 describe-instances --instance-ids "$EXISTING_ID" \
+              --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' \
+              --output text 2>/dev/null || true)
+            ROOT_GB=0
+            if [ -n "$ROOT_VOL" ] && [ "$ROOT_VOL" != "None" ]; then
+              ROOT_GB=$(aws ec2 describe-volumes --volume-ids "$ROOT_VOL" \
+                --query 'Volumes[0].Size' --output text 2>/dev/null || echo "0")
+            fi
+            if [ -n "$ROOT_GB" ] && [ "$ROOT_GB" -ge 150 ] 2>/dev/null; then
+              EXISTING_IP=$(aws ec2 describe-instances --instance-ids "$EXISTING_ID" \
+                --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null)
+              if [ -n "$EXISTING_IP" ] && [ "$EXISTING_IP" != "None" ]; then
+                echo "Found existing instance ($ROOT_GB GB root): $EXISTING_IP"
+                echo "host=$EXISTING_IP" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            else
+              echo "Existing instance has only ${ROOT_GB}GB root (need 150+). Terminating for rebuild..."
+              aws ec2 terminate-instances --instance-ids "$EXISTING_ID"
+              echo "Waiting for termination..."
+              aws ec2 wait instance-terminated --instance-ids "$EXISTING_ID"
             fi
           fi
 
-          echo "No running instance found. Ensuring Elastic IP..."
+          echo "Creating new instance. Ensuring Elastic IP..."
           ALLOC_ID=$(aws ec2 describe-addresses \
             --filters "Name=tag:Name,Values=$EIP_TAG" "Name=domain,Values=vpc" \
             --query 'Addresses[?AssociationId==null].AllocationId | [0]' \
