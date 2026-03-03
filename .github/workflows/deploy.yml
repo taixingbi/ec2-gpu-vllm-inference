@@ -157,7 +157,7 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new deploy/docker-compose.yml deploy/.env.example "ubuntu@$EC2_HOST:~/deploy/"
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new deploy/docker-compose.yml deploy/.env.example deploy/run-vllm.sh "ubuntu@$EC2_HOST:~/deploy/"
 
       - name: SSH Deploy
         uses: appleboy/ssh-action@v1.0.3

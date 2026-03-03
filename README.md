@@ -28,7 +28,8 @@ Replace `EC2_IP` with your instance's Elastic IP (output by the deploy workflow)
 
 | Variable | Description |
 |----------|-------------|
-| `AWS_AMI_ID` | GPU Deep Learning AMI (Ubuntu) for your region. Find at [AWS DLAMI](https://aws.amazon.com/machine-learning/amis/) |
+| `AWS_AMI_ID` | GPU Deep Learning AMI (Ubuntu) for your region. Optional: workflow auto-resolves if unset. [AWS DLAMI](https://aws.amazon.com/machine-learning/amis/) |
+| `AWS_REGION` | AWS region (default: `us-east-1`) |
 | `AWS_SECURITY_GROUP_ID` | Security group with inbound: 22 (SSH), 8000 |
 | `EC2_KEY_PAIR` | SSH key pair name (default: `ec2`) |
 
@@ -53,7 +54,7 @@ Replace `EC2_IP` with your instance's Elastic IP (output by the deploy workflow)
 ```bash
 cd deploy
 cp .env.example .env
-# Edit .env if needed (models, HUGGING_FACE_HUB_TOKEN)
+# Edit .env if needed (INFER_MODEL, VLLM_IMAGE, VLLM_USE_NGC, HUGGING_FACE_HUB_TOKEN)
 
 docker compose pull
 docker compose up -d
@@ -67,13 +68,29 @@ Models are cached in `/opt/models` on the host (or `~/.cache/huggingface` if you
 
 ## Deploy
 
-Push to `qa` or run the workflow manually. The workflow will:
+**Trigger:** Push to `qa` or run the workflow manually (Actions → Deploy vLLM → Run workflow; choose `prod` or `qa`).
+
+The workflow will:
 
 1. Create a g5.xlarge instance (or reuse existing)
 2. Allocate/associate an Elastic IP
 3. Install Docker + NVIDIA Container Toolkit
-4. Run vLLM inference container
+4. Run vLLM inference container (restarts on crash/reboot)
 
 ## Model configuration
 
-Edit `deploy/.env.example` in the repo to change the model before deploying. Default: `Qwen/Qwen2.5-7B-Instruct`
+Edit `deploy/.env.example` in the repo before deploying:
+
+| Variable | Description |
+|----------|-------------|
+| `INFER_MODEL` | Model to serve (default: `Qwen/Qwen2.5-7B-Instruct`) |
+| `VLLM_IMAGE` | Docker image (default: `vllm/vllm-openai:cu130-nightly`). Use `nvcr.io/nvidia/pytorch:25.01-py3` for NGC + pip install |
+| `VLLM_USE_NGC` | Set to `1` when using NGC image (runs `pip install vllm` on startup) |
+
+**Troubleshooting:** If you hit driver 803 or numpy/flash-attn errors, switch to NGC mode: set `VLLM_IMAGE=nvcr.io/nvidia/pytorch:25.01-py3` and `VLLM_USE_NGC=1` in `deploy/.env`.
+
+
+## analysis test
+
+ssh -i "ec2.pem" ubuntu@ec2-100-48-29-5.compute-1.amazonaws.com
+curl -sSf http://127.0.0.1:8000/v1/models | head
