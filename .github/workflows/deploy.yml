@@ -179,6 +179,7 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
+          command_timeout: 30m
           script: |
             set -e
 
@@ -227,14 +228,15 @@ jobs:
             sudo docker compose pull
             sudo docker compose up -d
 
-            echo "=== Waiting for vLLM services ==="
-            for i in $(seq 1 60); do
+            echo "=== Waiting for vLLM services (models may take 5-10 min to load) ==="
+            for i in $(seq 1 120); do
               if curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1 && curl -sf http://127.0.0.1:8001/v1/models >/dev/null 2>&1; then
                 echo "Both services ready"
                 break
               fi
-              if [ $i -eq 60 ]; then
-                echo "Timeout waiting for vLLM. Inference logs:"
+              [ $((i % 12)) -eq 0 ] && echo "Still waiting... ($((i*5))s)"
+              if [ $i -eq 120 ]; then
+                echo "Timeout waiting for vLLM (10 min). Inference logs:"
                 sudo docker logs vllm_infer --tail 30 2>&1 || true
                 echo "Embedding logs:"
                 sudo docker logs vllm_embed --tail 30 2>&1 || true
