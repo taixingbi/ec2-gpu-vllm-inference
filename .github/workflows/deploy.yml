@@ -113,7 +113,7 @@ jobs:
             --key-name "$EC2_KEY_PAIR" \
             --security-group-ids "$AWS_SECURITY_GROUP_ID" \
             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME}]" \
-            --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=200,VolumeType=gp3}' \
+            --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=200,VolumeType=gp3}' 'DeviceName=/dev/sdb,Ebs={VolumeSize=150,VolumeType=gp3}' \
             --query 'Instances[0].InstanceId' \
             --output text)
 
@@ -188,6 +188,28 @@ jobs:
               sudo apt-get install -y nvidia-container-toolkit
               sudo nvidia-ctk runtime configure --runtime=docker
               sudo systemctl restart docker
+            fi
+
+            echo "=== Use second EBS volume for Docker data (150GB) ==="
+            if [ -b /dev/sdb ] && ! mountpoint -q /mnt/docker-data 2>/dev/null; then
+              if ! sudo blkid /dev/sdb 2>/dev/null | grep -q ext4; then
+                echo "Formatting /dev/sdb..."
+                sudo mkfs -t ext4 -F /dev/sdb
+              fi
+              sudo mkdir -p /mnt/docker-data
+              sudo mount /dev/sdb /mnt/docker-data
+              echo "/dev/sdb /mnt/docker-data ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
+              sudo mkdir -p /etc/docker
+              sudo python3 -c "
+              import json, os
+              p='/etc/docker/daemon.json'
+              d=json.load(open(p)) if os.path.exists(p) else {}
+              d['data-root']='/mnt/docker-data'
+              json.dump(d, open('/tmp/daemon.json','w'), indent=2)
+              "
+              sudo mv /tmp/daemon.json /etc/docker/daemon.json
+              sudo systemctl restart docker
+              echo "Docker using 150GB volume at /mnt/docker-data"
             fi
 
             echo "=== Free disk space before pull ==="
