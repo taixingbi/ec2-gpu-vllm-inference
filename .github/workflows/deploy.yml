@@ -190,26 +190,39 @@ jobs:
               sudo systemctl restart docker
             fi
 
-            echo "=== Use second EBS volume for Docker data (150GB) ==="
-            if [ -b /dev/sdb ] && ! mountpoint -q /mnt/docker-data 2>/dev/null; then
+            echo "=== Use second EBS volume for containerd + Docker (150GB) ==="
+            if [ -b /dev/sdb ] && ! mountpoint -q /mnt/container-data 2>/dev/null; then
               if ! sudo blkid /dev/sdb 2>/dev/null | grep -q ext4; then
                 echo "Formatting /dev/sdb..."
                 sudo mkfs -t ext4 -F /dev/sdb
               fi
-              sudo mkdir -p /mnt/docker-data
-              sudo mount /dev/sdb /mnt/docker-data
-              echo "/dev/sdb /mnt/docker-data ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
+              sudo mkdir -p /mnt/container-data/containerd /mnt/container-data/docker
+              sudo mount /dev/sdb /mnt/container-data
+              echo "/dev/sdb /mnt/container-data ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
+
+              echo "Configuring containerd to use 150GB volume..."
+              sudo systemctl stop docker 2>/dev/null || true
+              sudo systemctl stop containerd 2>/dev/null || true
+              sudo mkdir -p /etc/containerd
+              if [ -f /etc/containerd/config.toml ]; then
+                sudo sed -i 's|root = .*|root = "/mnt/container-data/containerd"|' /etc/containerd/config.toml
+              else
+                sudo containerd config default 2>/dev/null | sudo sed 's|root = .*|root = "/mnt/container-data/containerd"|' | sudo tee /etc/containerd/config.toml
+              fi
+
               sudo mkdir -p /etc/docker
               sudo python3 -c "
               import json, os
               p='/etc/docker/daemon.json'
               d=json.load(open(p)) if os.path.exists(p) else {}
-              d['data-root']='/mnt/docker-data'
+              d['data-root']='/mnt/container-data/docker'
               json.dump(d, open('/tmp/daemon.json','w'), indent=2)
               "
               sudo mv /tmp/daemon.json /etc/docker/daemon.json
-              sudo systemctl restart docker
-              echo "Docker using 150GB volume at /mnt/docker-data"
+
+              sudo systemctl start containerd
+              sudo systemctl start docker
+              echo "Containerd + Docker using 150GB volume at /mnt/container-data"
             fi
 
             echo "=== Free disk space before pull ==="
