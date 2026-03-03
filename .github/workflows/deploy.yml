@@ -41,17 +41,22 @@ jobs:
         run: |
           set -e
           if [ -z "$AWS_AMI_ID" ]; then
-            echo "AWS_AMI_ID not set, fetching latest GPU DLAMI from SSM..."
-            AWS_AMI_ID=$(aws ssm get-parameter \
+            echo "AWS_AMI_ID not set, auto-resolving latest Deep Learning GPU AMI..."
+            AWS_AMI_ID="$(aws ec2 describe-images \
               --region "$AWS_REGION" \
-              --name "/aws/service/deeplearning/ami/x86_64/oss-nvidia-driver-gpu-pytorch-2.8-ubuntu-24.04/latest/ami-id" \
-              --query "Parameter.Value" \
-              --output text 2>/dev/null || true)
+              --owners amazon \
+              --filters \
+                "Name=name,Values=Deep Learning AMI GPU CUDA*Ubuntu*" \
+                "Name=state,Values=available" \
+                "Name=architecture,Values=x86_64" \
+                "Name=root-device-type,Values=ebs" \
+              --query "Images | sort_by(@, &CreationDate) | [-1].ImageId" \
+              --output text)"
             if [ -z "$AWS_AMI_ID" ] || [ "$AWS_AMI_ID" = "None" ]; then
-              echo "Error: Could not fetch GPU AMI. Set AWS_AMI_ID in repo vars or check SSM parameter for your region."
+              echo "ERROR: Could not auto-resolve a Deep Learning GPU AMI in region $AWS_REGION"
               exit 1
             fi
-            echo "Using AMI: $AWS_AMI_ID"
+            echo "Using GPU AMI: $AWS_AMI_ID"
           fi
           if [ -z "$AWS_SECURITY_GROUP_ID" ]; then
             echo "Resolving security group by name 'ec2'..."
