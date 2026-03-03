@@ -1,0 +1,37 @@
+services:
+  vllm_infer:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_infer
+    runtime: nvidia
+    ipc: host
+    ports:
+      - "8000:8000"
+    volumes:
+      - /opt/models:/root/.cache/huggingface
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    command: >
+      --model ${INFER_MODEL}
+      --host 0.0.0.0
+      --port 8000
+      --gpu-memory-utilization 0.80
+
+  vllm_embed:
+    image: vllm/vllm-openai:latest
+    container_name: vllm_embed
+    runtime: nvidia
+    ipc: host
+    ports:
+      - "8001:8001"
+    volumes:
+      - /opt/models:/root/.cache/huggingface
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    command: >
+      --model ${EMBED_MODEL}
+      --host 0.0.0.0
+      --port 8001
+      --runner pooling
+      --gpu-memory-utilization 0.20

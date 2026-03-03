@@ -1,0 +1,203 @@
+name: Deploy vLLM (inference + embeddings) to EC2 GPU
+
+on:
+  push:
+    branches:
+      - qa
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deploy target"
+        required: true
+        default: "prod"
+        type: choice
+        options:
+          - prod
+          - qa
+
+env:
+  TARGET_ENV: ${{ github.event.inputs.environment || 'qa' }}
+
+jobs:
+  ensure-instance:
+    runs-on: ubuntu-latest
+    outputs:
+      host: ${{ steps.ensure.outputs.host }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Ensure EC2 instance exists
+        id: ensure
+        env:
+          AWS_AMI_ID: ${{ vars.AWS_AMI_ID }}
+          AWS_SECURITY_GROUP_ID: ${{ vars.AWS_SECURITY_GROUP_ID }}
+          EC2_KEY_PAIR: ${{ vars.EC2_KEY_PAIR || 'ec2' }}
+        run: |
+          set -e
+          if [ -z "$AWS_AMI_ID" ]; then
+            echo "Error: AWS_AMI_ID must be set (GPU Deep Learning AMI for your region)"
+            exit 1
+          fi
+          if [ -z "$AWS_SECURITY_GROUP_ID" ]; then
+            echo "Resolving security group by name 'ec2'..."
+            AWS_SECURITY_GROUP_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=ec2" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+            if [ -z "$AWS_SECURITY_GROUP_ID" ] || [ "$AWS_SECURITY_GROUP_ID" = "None" ]; then
+              echo "Error: Set AWS_SECURITY_GROUP_ID or create security group 'ec2' with inbound 22, 8000, 8001"
+              exit 1
+            fi
+          fi
+
+          INSTANCE_NAME="ec2-gpu-vllm"
+          EIP_TAG="ec2-gpu-vllm-eip"
+
+          echo "Looking for running instance with tag Name=$INSTANCE_NAME..."
+          EXISTING=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[*].Instances[0].[InstanceId,PublicIpAddress]' \
+            --output text 2>/dev/null | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            EXISTING_IP=$(echo "$EXISTING" | awk '{print $2}')
+            if [ -n "$EXISTING_IP" ] && [ "$EXISTING_IP" != "None" ]; then
+              echo "Found existing instance: $EXISTING_IP"
+              echo "host=$EXISTING_IP" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "No running instance found. Ensuring Elastic IP..."
+          ALLOC_ID=$(aws ec2 describe-addresses \
+            --filters "Name=tag:Name,Values=$EIP_TAG" "Name=domain,Values=vpc" \
+            --query 'Addresses[?AssociationId==null].AllocationId | [0]' \
+            --output text 2>/dev/null || true)
+
+          if [ -z "$ALLOC_ID" ] || [ "$ALLOC_ID" = "None" ]; then
+            ALLOC_ID=$(aws ec2 allocate-address --domain vpc --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=$EIP_TAG}]" --query 'AllocationId' --output text)
+            echo "Allocated new EIP: $ALLOC_ID"
+          else
+            echo "Using existing unassociated EIP: $ALLOC_ID"
+          fi
+
+          echo "Creating g5.xlarge instance..."
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "$AWS_AMI_ID" \
+            --instance-type g5.xlarge \
+            --key-name "$EC2_KEY_PAIR" \
+            --security-group-ids "$AWS_SECURITY_GROUP_ID" \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME}]" \
+            --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=50,VolumeType=gp3}' \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "Created instance $INSTANCE_ID. Waiting for running state..."
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+
+          echo "Associating Elastic IP..."
+          aws ec2 associate-address --instance-id "$INSTANCE_ID" --allocation-id "$ALLOC_ID"
+
+          EIP=$(aws ec2 describe-addresses --allocation-ids "$ALLOC_ID" --query 'Addresses[0].PublicIp' --output text)
+          echo "Instance ready at $EIP"
+
+          echo "Waiting for SSH..."
+          for j in $(seq 1 24); do
+            if nc -z -w 5 "$EIP" 22 2>/dev/null; then
+              echo "SSH ready"
+              echo "host=$EIP" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [ $j -eq 24 ] && { echo "Timeout waiting for SSH"; exit 1; }
+            sleep 5
+          done
+
+  deploy:
+    needs: ensure-instance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy deploy files to EC2
+        env:
+          EC2_HOST: ${{ needs.ensure-instance.outputs.host }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new deploy/docker-compose.yml deploy/.env.example "ubuntu@$EC2_HOST:~/deploy/"
+
+      - name: SSH Deploy
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          HF_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+        with:
+          host: ${{ needs.ensure-instance.outputs.host }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+
+            echo "=== Install Docker ==="
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo apt-get install -y ca-certificates curl gnupg
+              sudo install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo apt-get update -y
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+              sudo usermod -aG docker ubuntu || true
+            fi
+
+            echo "=== Install NVIDIA Container Toolkit ==="
+            if ! sudo docker info 2>/dev/null | grep -q "Runtimes:.*nvidia"; then
+              curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+              curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+                sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+                sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+              sudo apt-get update -y
+              sudo apt-get install -y nvidia-container-toolkit
+              sudo nvidia-ctk runtime configure --runtime=docker
+              sudo systemctl restart docker
+            fi
+
+            echo "=== Prepare deploy directory ==="
+            mkdir -p ~/deploy /opt/models
+            cd ~/deploy
+            if [ ! -f .env ]; then
+              cp .env.example .env
+            fi
+            if [ -n "$HF_TOKEN" ]; then
+              sed -i '/^HUGGING_FACE_HUB_TOKEN=/d' .env
+              printf 'HUGGING_FACE_HUB_TOKEN=%s\n' "$HF_TOKEN" >> .env
+            fi
+
+            echo "=== Deploy vLLM containers ==="
+            sudo docker compose pull
+            sudo docker compose up -d
+
+            echo "=== Waiting for vLLM services ==="
+            for i in $(seq 1 60); do
+              if curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1 && curl -sf http://127.0.0.1:8001/v1/models >/dev/null 2>&1; then
+                echo "Both services ready"
+                break
+              fi
+              if [ $i -eq 60 ]; then
+                echo "Timeout waiting for vLLM. Inference logs:"
+                sudo docker logs vllm_infer --tail 30 2>&1 || true
+                echo "Embedding logs:"
+                sudo docker logs vllm_embed --tail 30 2>&1 || true
+                exit 1
+              fi
+              sleep 5
+            done
+
+            echo "=== Done ==="
+            sudo docker logs vllm_infer --tail 3 2>&1 || true
+            sudo docker logs vllm_embed --tail 3 2>&1 || true
