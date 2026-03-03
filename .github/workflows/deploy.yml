@@ -191,7 +191,8 @@ jobs:
             fi
 
             echo "=== Prepare deploy directory ==="
-            mkdir -p ~/deploy /opt/models
+            mkdir -p ~/deploy
+            sudo mkdir -p /opt/models
             cd ~/deploy
             if [ ! -f .env ]; then
               cp .env.example .env
