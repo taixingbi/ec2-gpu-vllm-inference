@@ -35,20 +35,30 @@ jobs:
         id: ensure
         env:
           AWS_AMI_ID: ${{ vars.AWS_AMI_ID }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
           AWS_SECURITY_GROUP_ID: ${{ vars.AWS_SECURITY_GROUP_ID }}
           EC2_KEY_PAIR: ${{ vars.EC2_KEY_PAIR || 'ec2' }}
         run: |
           set -e
           if [ -z "$AWS_AMI_ID" ]; then
-            echo "Error: AWS_AMI_ID must be set (GPU Deep Learning AMI for your region)"
-            exit 1
+            echo "AWS_AMI_ID not set, fetching latest GPU DLAMI from SSM..."
+            AWS_AMI_ID=$(aws ssm get-parameter \
+              --region "$AWS_REGION" \
+              --name "/aws/service/deeplearning/ami/x86_64/oss-nvidia-driver-gpu-pytorch-2.8-ubuntu-24.04/latest/ami-id" \
+              --query "Parameter.Value" \
+              --output text 2>/dev/null || true)
+            if [ -z "$AWS_AMI_ID" ] || [ "$AWS_AMI_ID" = "None" ]; then
+              echo "Error: Could not fetch GPU AMI. Set AWS_AMI_ID in repo vars or check SSM parameter for your region."
+              exit 1
+            fi
+            echo "Using AMI: $AWS_AMI_ID"
           fi
           if [ -z "$AWS_SECURITY_GROUP_ID" ]; then
             echo "Resolving security group by name 'ec2'..."
             AWS_SECURITY_GROUP_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=ec2" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
             if [ -z "$AWS_SECURITY_GROUP_ID" ] || [ "$AWS_SECURITY_GROUP_ID" = "None" ]; then
-              echo "Error: Set AWS_SECURITY_GROUP_ID or create security group 'ec2' with inbound 22, 8000, 8001"
-              exit 1
+              AWS_SECURITY_GROUP_ID="sg-01dad3e1686a3d49f"
+              echo "Using default security group $AWS_SECURITY_GROUP_ID"
             fi
           fi
 
