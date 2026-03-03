@@ -46,14 +46,22 @@ jobs:
               --region "$AWS_REGION" \
               --owners amazon \
               --filters \
-                "Name=name,Values=Deep Learning AMI GPU CUDA*Ubuntu*" \
+                "Name=name,Values=Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) ????????" \
                 "Name=state,Values=available" \
                 "Name=architecture,Values=x86_64" \
-                "Name=root-device-type,Values=ebs" \
               --query "Images | sort_by(@, &CreationDate) | [-1].ImageId" \
-              --output text)"
+              --output text 2>/dev/null || true)"
             if [ -z "$AWS_AMI_ID" ] || [ "$AWS_AMI_ID" = "None" ]; then
-              echo "ERROR: Could not auto-resolve a Deep Learning GPU AMI in region $AWS_REGION"
+              echo "describe-images returned nothing, trying SSM Parameter Store..."
+              for SSM_PATH in \
+                "/aws/service/deeplearning/ami/x86_64/oss-nvidia-driver-gpu-pytorch-2.8-ubuntu-24.04/latest/ami-id" \
+                "/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-ubuntu-22.04/latest/ami-id"; do
+                AWS_AMI_ID="$(aws ssm get-parameter --region "$AWS_REGION" --name "$SSM_PATH" --query "Parameter.Value" --output text 2>/dev/null || true)"
+                [ -n "$AWS_AMI_ID" ] && [ "$AWS_AMI_ID" != "None" ] && break
+              done
+            fi
+            if [ -z "$AWS_AMI_ID" ] || [ "$AWS_AMI_ID" = "None" ]; then
+              echo "ERROR: Could not auto-resolve a Deep Learning GPU AMI in region $AWS_REGION. Set AWS_AMI_ID in repo vars."
               exit 1
             fi
             echo "Using GPU AMI: $AWS_AMI_ID"
