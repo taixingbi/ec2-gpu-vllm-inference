@@ -190,6 +190,11 @@ jobs:
               sudo systemctl restart docker
             fi
 
+            echo "=== Free disk space before pull ==="
+            sudo apt-get clean 2>/dev/null || true
+            sudo journalctl --vacuum-time=1h 2>/dev/null || true
+            sudo docker system prune -af 2>/dev/null || true
+
             echo "=== Prepare deploy directory ==="
             mkdir -p ~/deploy
             sudo mkdir -p /opt/models
