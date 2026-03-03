@@ -179,7 +179,7 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
-          command_timeout: 30m
+          command_timeout: 45m
           script: |
             set -e
 
@@ -228,23 +228,31 @@ jobs:
             sudo docker compose pull
             sudo docker compose up -d
 
-            echo "=== Waiting for vLLM services (models may take 5-10 min to load) ==="
-            for i in $(seq 1 120); do
-              if curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1 && curl -sf http://127.0.0.1:8001/v1/models >/dev/null 2>&1; then
+            echo "=== Waiting for vLLM services (models may take 5-15 min to load) ==="
+            sudo docker ps -a
+            for i in $(seq 1 180); do
+              INFER_OK=$(curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1 && echo 1 || echo 0)
+              EMBED_OK=$(curl -sf http://127.0.0.1:8001/v1/models >/dev/null 2>&1 && echo 1 || echo 0)
+              if [ "$INFER_OK" = "1" ] && [ "$EMBED_OK" = "1" ]; then
                 echo "Both services ready"
                 break
               fi
-              [ $((i % 12)) -eq 0 ] && echo "Still waiting... ($((i*5))s)"
-              if [ $i -eq 120 ]; then
-                echo "Timeout waiting for vLLM (10 min). Inference logs:"
-                sudo docker logs vllm_infer --tail 30 2>&1 || true
+              if [ $((i % 12)) -eq 0 ]; then
+                echo "Still waiting... $((i*5))s (infer=$INFER_OK embed=$EMBED_OK)"
+                sudo docker ps -a --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
+              fi
+              if [ $i -eq 180 ]; then
+                echo "Timeout (15 min). Container status:"
+                sudo docker ps -a
+                echo "Inference logs:"
+                sudo docker logs vllm_infer --tail 50 2>&1 || true
                 echo "Embedding logs:"
-                sudo docker logs vllm_embed --tail 30 2>&1 || true
+                sudo docker logs vllm_embed --tail 50 2>&1 || true
                 exit 1
               fi
               sleep 5
             done
 
             echo "=== Done ==="
-            sudo docker logs vllm_infer --tail 3 2>&1 || true
-            sudo docker logs vllm_embed --tail 3 2>&1 || true
+            sudo docker logs vllm_infer --tail 5 2>&1 || true
+            sudo docker logs vllm_embed --tail 5 2>&1 || true
