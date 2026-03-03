@@ -113,7 +113,7 @@ jobs:
             --key-name "$EC2_KEY_PAIR" \
             --security-group-ids "$AWS_SECURITY_GROUP_ID" \
             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME}]" \
-            --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=200,VolumeType=gp3}' 'DeviceName=/dev/sdb,Ebs={VolumeSize=150,VolumeType=gp3}' \
+            --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=200,VolumeType=gp3}' \
             --query 'Instances[0].InstanceId' \
             --output text)
 
@@ -166,15 +166,6 @@ jobs:
           script: |
             set -e
 
-            echo "=== Check disk (need 150GB volume for vLLM images) ==="
-            if [ ! -b /dev/sdb ]; then
-              ROOT_FREE=$(df -BG / | tail -1 | awk '{print $4}' | tr -d 'G')
-              if [ -n "$ROOT_FREE" ] && [ "$ROOT_FREE" -lt 100 ]; then
-                echo "ERROR: No /dev/sdb and only ${ROOT_FREE}GB free on root. Terminate this instance and re-run workflow to create a new instance with 200GB root + 150GB Docker volume."
-                exit 1
-              fi
-            fi
-
             echo "=== Install Docker ==="
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update -y
@@ -197,23 +188,6 @@ jobs:
               sudo apt-get install -y nvidia-container-toolkit
               sudo nvidia-ctk runtime configure --runtime=docker
               sudo systemctl restart docker
-            fi
-
-            echo "=== Mount second EBS volume at /var/lib/containerd (150GB) ==="
-            if [ -b /dev/sdb ] && ! mountpoint -q /var/lib/containerd 2>/dev/null; then
-              if ! sudo blkid /dev/sdb 2>/dev/null | grep -q ext4; then
-                echo "Formatting /dev/sdb..."
-                sudo mkfs -t ext4 -F /dev/sdb
-              fi
-              sudo systemctl stop docker 2>/dev/null || true
-              sudo systemctl stop containerd 2>/dev/null || true
-              sudo rm -rf /var/lib/containerd/*
-              sudo mkdir -p /var/lib/containerd
-              sudo mount /dev/sdb /var/lib/containerd
-              echo "/dev/sdb /var/lib/containerd ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
-              sudo systemctl start containerd
-              sudo systemctl start docker
-              echo "Containerd using 150GB volume at /var/lib/containerd"
             fi
 
             echo "=== Free disk space before pull ==="
