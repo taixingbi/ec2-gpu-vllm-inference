@@ -1,4 +1,4 @@
-name: Deploy vLLM (inference + embeddings) to EC2 GPU
+name: Deploy vLLM (inference) to EC2 GPU
 
 on:
   push:
@@ -85,22 +85,15 @@ jobs:
             --output text 2>/dev/null || true)
 
           if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "None" ]; then
-            ROOT_VOL=$(aws ec2 describe-instances --instance-ids "$EXISTING_ID" \
-              --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' \
-              --output text 2>/dev/null || true)
+            INST=$(aws ec2 describe-instances --instance-ids "$EXISTING_ID" --query 'Reservations[0].Instances[0].[PublicIpAddress,BlockDeviceMappings[0].Ebs.VolumeId]' --output text 2>/dev/null)
+            EXISTING_IP=$(echo "$INST" | cut -f1)
+            ROOT_VOL=$(echo "$INST" | cut -f2)
             ROOT_GB=0
-            if [ -n "$ROOT_VOL" ] && [ "$ROOT_VOL" != "None" ]; then
-              ROOT_GB=$(aws ec2 describe-volumes --volume-ids "$ROOT_VOL" \
-                --query 'Volumes[0].Size' --output text 2>/dev/null || echo "0")
-            fi
-            if [ -n "$ROOT_GB" ] && [ "$ROOT_GB" -ge 150 ] 2>/dev/null; then
-              EXISTING_IP=$(aws ec2 describe-instances --instance-ids "$EXISTING_ID" \
-                --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null)
-              if [ -n "$EXISTING_IP" ] && [ "$EXISTING_IP" != "None" ]; then
-                echo "Found existing instance ($ROOT_GB GB root): $EXISTING_IP"
-                echo "host=$EXISTING_IP" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
+            [ -n "$ROOT_VOL" ] && [ "$ROOT_VOL" != "None" ] && ROOT_GB=$(aws ec2 describe-volumes --volume-ids "$ROOT_VOL" --query 'Volumes[0].Size' --output text 2>/dev/null || echo "0")
+            if [ -n "$ROOT_GB" ] && [ "$ROOT_GB" -ge 150 ] 2>/dev/null && [ -n "$EXISTING_IP" ] && [ "$EXISTING_IP" != "None" ]; then
+              echo "Found existing instance ($ROOT_GB GB root): $EXISTING_IP"
+              echo "host=$EXISTING_IP" >> "$GITHUB_OUTPUT"
+              exit 0
             else
               echo "Existing instance has only ${ROOT_GB}GB root (need 150+). Terminating for rebuild..."
               aws ec2 terminate-instances --instance-ids "$EXISTING_ID"
@@ -144,11 +137,7 @@ jobs:
 
           echo "Waiting for SSH..."
           for j in $(seq 1 24); do
-            if nc -z -w 5 "$EIP" 22 2>/dev/null; then
-              echo "SSH ready"
-              echo "host=$EIP" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+            nc -z -w 3 "$EIP" 22 2>/dev/null && { echo "SSH ready"; echo "host=$EIP" >> "$GITHUB_OUTPUT"; exit 0; }
             [ $j -eq 24 ] && { echo "Timeout waiting for SSH"; exit 1; }
             sleep 5
           done
@@ -179,12 +168,14 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
-          command_timeout: 45m
+          command_timeout: 30m
           script: |
             set -e
 
-            echo "=== Install Docker ==="
-            if ! command -v docker >/dev/null 2>&1; then
+            NEED_APT=false
+            if ! command -v docker >/dev/null 2>&1; then NEED_APT=true; fi
+            if [ "$NEED_APT" = true ]; then
+              echo "=== Install Docker ==="
               sudo apt-get update -y
               sudo apt-get install -y ca-certificates curl gnupg
               sudo install -m 0755 -d /etc/apt/keyrings
@@ -195,8 +186,9 @@ jobs:
               sudo usermod -aG docker ubuntu || true
             fi
 
-            echo "=== Install NVIDIA Container Toolkit ==="
             if ! sudo docker info 2>/dev/null | grep -q "Runtimes:.*nvidia"; then
+              echo "=== Install NVIDIA Container Toolkit ==="
+              [ "$NEED_APT" != true ] && sudo apt-get update -y
               curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
               curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
                 sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
@@ -228,26 +220,21 @@ jobs:
             sudo docker compose pull
             sudo docker compose up -d
 
-            echo "=== Waiting for vLLM services (models may take 5-15 min to load) ==="
+            echo "=== Waiting for vLLM (models may take 5-15 min to load) ==="
             sudo docker ps -a
             for i in $(seq 1 180); do
-              INFER_OK=$(curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1 && echo 1 || echo 0)
-              EMBED_OK=$(curl -sf http://127.0.0.1:8001/v1/models >/dev/null 2>&1 && echo 1 || echo 0)
-              if [ "$INFER_OK" = "1" ] && [ "$EMBED_OK" = "1" ]; then
-                echo "Both services ready"
+              if curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1; then
+                echo "vLLM ready"
                 break
               fi
               if [ $((i % 12)) -eq 0 ]; then
-                echo "Still waiting... $((i*5))s (infer=$INFER_OK embed=$EMBED_OK)"
+                echo "Still waiting... $((i*5))s"
                 sudo docker ps -a --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
               fi
               if [ $i -eq 180 ]; then
                 echo "Timeout (15 min). Container status:"
                 sudo docker ps -a
-                echo "Inference logs:"
                 sudo docker logs vllm_infer --tail 50 2>&1 || true
-                echo "Embedding logs:"
-                sudo docker logs vllm_embed --tail 50 2>&1 || true
                 exit 1
               fi
               sleep 5
@@ -255,4 +242,3 @@ jobs:
 
             echo "=== Done ==="
             sudo docker logs vllm_infer --tail 5 2>&1 || true
-            sudo docker logs vllm_embed --tail 5 2>&1 || true
