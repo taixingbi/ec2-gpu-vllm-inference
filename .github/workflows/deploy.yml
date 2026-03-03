@@ -166,6 +166,15 @@ jobs:
           script: |
             set -e
 
+            echo "=== Check disk (need 150GB volume for vLLM images) ==="
+            if [ ! -b /dev/sdb ]; then
+              ROOT_FREE=$(df -BG / | tail -1 | awk '{print $4}' | tr -d 'G')
+              if [ -n "$ROOT_FREE" ] && [ "$ROOT_FREE" -lt 100 ]; then
+                echo "ERROR: No /dev/sdb and only ${ROOT_FREE}GB free on root. Terminate this instance and re-run workflow to create a new instance with 200GB root + 150GB Docker volume."
+                exit 1
+              fi
+            fi
+
             echo "=== Install Docker ==="
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update -y
@@ -190,39 +199,21 @@ jobs:
               sudo systemctl restart docker
             fi
 
-            echo "=== Use second EBS volume for containerd + Docker (150GB) ==="
-            if [ -b /dev/sdb ] && ! mountpoint -q /mnt/container-data 2>/dev/null; then
+            echo "=== Mount second EBS volume at /var/lib/containerd (150GB) ==="
+            if [ -b /dev/sdb ] && ! mountpoint -q /var/lib/containerd 2>/dev/null; then
               if ! sudo blkid /dev/sdb 2>/dev/null | grep -q ext4; then
                 echo "Formatting /dev/sdb..."
                 sudo mkfs -t ext4 -F /dev/sdb
               fi
-              sudo mkdir -p /mnt/container-data/containerd /mnt/container-data/docker
-              sudo mount /dev/sdb /mnt/container-data
-              echo "/dev/sdb /mnt/container-data ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
-
-              echo "Configuring containerd to use 150GB volume..."
               sudo systemctl stop docker 2>/dev/null || true
               sudo systemctl stop containerd 2>/dev/null || true
-              sudo mkdir -p /etc/containerd
-              if [ -f /etc/containerd/config.toml ]; then
-                sudo sed -i 's|root = .*|root = "/mnt/container-data/containerd"|' /etc/containerd/config.toml
-              else
-                sudo containerd config default 2>/dev/null | sudo sed 's|root = .*|root = "/mnt/container-data/containerd"|' | sudo tee /etc/containerd/config.toml
-              fi
-
-              sudo mkdir -p /etc/docker
-              sudo python3 -c "
-              import json, os
-              p='/etc/docker/daemon.json'
-              d=json.load(open(p)) if os.path.exists(p) else {}
-              d['data-root']='/mnt/container-data/docker'
-              json.dump(d, open('/tmp/daemon.json','w'), indent=2)
-              "
-              sudo mv /tmp/daemon.json /etc/docker/daemon.json
-
+              sudo rm -rf /var/lib/containerd/*
+              sudo mkdir -p /var/lib/containerd
+              sudo mount /dev/sdb /var/lib/containerd
+              echo "/dev/sdb /var/lib/containerd ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
               sudo systemctl start containerd
               sudo systemctl start docker
-              echo "Containerd + Docker using 150GB volume at /mnt/container-data"
+              echo "Containerd using 150GB volume at /var/lib/containerd"
             fi
 
             echo "=== Free disk space before pull ==="
