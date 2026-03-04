@@ -1,0 +1,33 @@
+services:
+  vllm_infer:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:cu130-nightly}
+    container_name: vllm_infer
+    restart: unless-stopped
+    runtime: nvidia
+    ipc: host
+    entrypoint: ["/usr/local/bin/run-vllm.sh"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./run-vllm.sh:/usr/local/bin/run-vllm.sh:ro
+      - /opt/models:/root/.cache/huggingface
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+      - VLLM_USE_NGC=${VLLM_USE_NGC:-0}
+    command:
+      - ${INFER_MODEL}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --max-model-len
+      - "4096"
+      - --gpu-memory-utilization
+      - "0.90"
+      - --max-num-seqs
+      - "16"
+      - --max-num-batched-tokens
+      - "8192"
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
