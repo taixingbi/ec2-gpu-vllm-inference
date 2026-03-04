@@ -27,8 +27,10 @@ services:
       - --gpu-memory-utilization
       - "0.90"
       - --max-num-seqs
-      - "1"
-      - --enforce-eager
+      - "16"
+      - --max-num-batched-tokens
+      - "8192"
+      - --scheduler-policy
+      - "fcfs"
       - --enable-prefix-caching
       - --enable-chunked-prefill
-      - --disable-log-stats
