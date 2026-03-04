@@ -75,9 +75,8 @@ jobs:
             fi
           fi
 
-          INSTANCE_NAME="ec2-gpu-vllm"
-          EIP_TAG="ec2-gpu-vllm-eip"
-
+          INSTANCE_NAME="ec2-gpu-vllm-inference"
+          EIP_TAG="ec2-gpu-vllm-inference-eip"
           echo "Looking for running instance with tag Name=$INSTANCE_NAME..."
           EXISTING_ID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running" \
