@@ -4,6 +4,7 @@
 set -euo pipefail
 
 DEPLOY_DIR="${DEPLOY_DIR:-/home/ubuntu/deploy}"
+NEED_APT=false
 if ! command -v docker >/dev/null 2>&1; then NEED_APT=true; fi
 if [ "$NEED_APT" = true ]; then
   echo "=== Install Docker ==="
