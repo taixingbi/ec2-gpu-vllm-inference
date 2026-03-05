@@ -39,6 +39,7 @@ sudo docker system prune -af 2>/dev/null || true
 echo "=== Prepare deploy directory ==="
 sudo mkdir -p /opt/models
 cd "$DEPLOY_DIR" || { echo "ERROR: $DEPLOY_DIR not found"; exit 1; }
+chmod +x run-vllm.sh
 if [ ! -f .env ]; then
   cp .env.example .env
 fi
