@@ -48,7 +48,9 @@ if [ -n "${HF_TOKEN:-}" ]; then
 fi
 
 echo "=== Deploy vLLM containers ==="
-sudo docker compose pull
+# Use -q to avoid SSM output limit (docker pull progress floods stderr)
+sudo docker compose pull -q
+echo "Pull done, starting containers..."
 sudo docker compose up -d
 
 echo "=== Waiting for vLLM (models may take 5-15 min to load) ==="
