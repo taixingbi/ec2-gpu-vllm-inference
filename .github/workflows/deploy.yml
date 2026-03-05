@@ -204,8 +204,9 @@ jobs:
           # Build JSON commands: escape HF_TOKEN for remote shell
           HF_ESC=$(printf '%s' "$HF_TOKEN" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')
           EXPORT_CMD="export HF_TOKEN=\"$HF_ESC\""
-          COMMANDS=$(jq -n --arg e "$EXPORT_CMD" --arg b "$DEPLOY_BUCKET" \
-            '["set -e", $e, "mkdir -p ~/deploy", ("aws s3 cp s3://" + $b + "/deploy/ ~/deploy/ --recursive"), "cd ~/deploy", "chmod +x remote-deploy.sh", "bash remote-deploy.sh"]')
+          DEPLOY_DIR="/home/ubuntu/deploy"
+          COMMANDS=$(jq -n --arg e "$EXPORT_CMD" --arg b "$DEPLOY_BUCKET" --arg d "$DEPLOY_DIR" \
+            '["set -e", $e, "mkdir -p " + $d, ("aws s3 cp s3://" + $b + "/deploy/ " + $d + "/ --recursive"), "chown -R ubuntu:ubuntu " + $d, "cd " + $d, "chmod +x remote-deploy.sh", "bash remote-deploy.sh"]')
           echo "Sending deploy command via SSM..."
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \

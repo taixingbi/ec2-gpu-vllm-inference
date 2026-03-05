@@ -1,9 +1,9 @@
 #!/bin/bash
 # Deploy script run via SSM on EC2. Expects HF_TOKEN env var (optional).
-# Run from ~/deploy after files are downloaded from S3.
+# Run from /home/ubuntu/deploy after files are downloaded from S3.
 set -euo pipefail
 
-NEED_APT=false
+DEPLOY_DIR="${DEPLOY_DIR:-/home/ubuntu/deploy}"
 if ! command -v docker >/dev/null 2>&1; then NEED_APT=true; fi
 if [ "$NEED_APT" = true ]; then
   echo "=== Install Docker ==="
@@ -37,7 +37,7 @@ sudo docker system prune -af 2>/dev/null || true
 
 echo "=== Prepare deploy directory ==="
 sudo mkdir -p /opt/models
-cd ~/deploy || { echo "ERROR: ~/deploy not found"; exit 1; }
+cd "$DEPLOY_DIR" || { echo "ERROR: $DEPLOY_DIR not found"; exit 1; }
 if [ ! -f .env ]; then
   cp .env.example .env
 fi
