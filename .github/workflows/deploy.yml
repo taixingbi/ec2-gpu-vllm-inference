@@ -17,29 +17,41 @@ on:
 
 env:
   TARGET_ENV: ${{ github.event.inputs.environment || 'qa' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+concurrency:
+  group: deploy-vllm-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   ensure-instance:
     runs-on: ubuntu-latest
     outputs:
       host: ${{ steps.ensure.outputs.host }}
+      instance_id: ${{ steps.ensure.outputs.instance_id }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Ensure EC2 instance exists
         id: ensure
         env:
           AWS_AMI_ID: ${{ vars.AWS_AMI_ID }}
-          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+          AWS_REGION: ${{ env.AWS_REGION }}
           AWS_SECURITY_GROUP_ID: ${{ vars.AWS_SECURITY_GROUP_ID }}
+          AWS_SECURITY_GROUP_NAME: ${{ vars.AWS_SECURITY_GROUP_NAME }}
           EC2_KEY_PAIR: ${{ vars.EC2_KEY_PAIR || 'ec2' }}
+          EC2_IAM_INSTANCE_PROFILE: ${{ vars.EC2_IAM_INSTANCE_PROFILE }}
         run: |
           set -e
+          if [ -z "$EC2_IAM_INSTANCE_PROFILE" ]; then
+            echo "ERROR: EC2_IAM_INSTANCE_PROFILE is required for SSM. Set it in repo vars (e.g. ec2-ssm-role)."
+            exit 1
+          fi
           if [ -z "$AWS_AMI_ID" ]; then
             echo "AWS_AMI_ID not set, auto-resolving latest Deep Learning GPU AMI..."
             AWS_AMI_ID="$(aws ec2 describe-images \
@@ -67,11 +79,12 @@ jobs:
             echo "Using GPU AMI: $AWS_AMI_ID"
           fi
           if [ -z "$AWS_SECURITY_GROUP_ID" ]; then
-            echo "Resolving security group by name 'ec2'..."
-            AWS_SECURITY_GROUP_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=ec2" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+            SG_NAME="${AWS_SECURITY_GROUP_NAME:-ec2}"
+            echo "Resolving security group by name '$SG_NAME'..."
+            AWS_SECURITY_GROUP_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$SG_NAME" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
             if [ -z "$AWS_SECURITY_GROUP_ID" ] || [ "$AWS_SECURITY_GROUP_ID" = "None" ]; then
-              AWS_SECURITY_GROUP_ID="sg-01dad3e1686a3d49f"
-              echo "Using default security group $AWS_SECURITY_GROUP_ID"
+              echo "ERROR: Could not resolve security group '$SG_NAME'. Set AWS_SECURITY_GROUP_ID or AWS_SECURITY_GROUP_NAME in repo vars."
+              exit 1
             fi
           fi
 
@@ -90,15 +103,20 @@ jobs:
             ROOT_GB=0
             [ -n "$ROOT_VOL" ] && [ "$ROOT_VOL" != "None" ] && ROOT_GB=$(aws ec2 describe-volumes --volume-ids "$ROOT_VOL" --query 'Volumes[0].Size' --output text 2>/dev/null || echo "0")
             if [ -n "$ROOT_GB" ] && [ "$ROOT_GB" -ge 150 ] 2>/dev/null && [ -n "$EXISTING_IP" ] && [ "$EXISTING_IP" != "None" ]; then
-              echo "Found existing instance ($ROOT_GB GB root): $EXISTING_IP"
-              echo "host=$EXISTING_IP" >> "$GITHUB_OUTPUT"
-              exit 0
+              SSM_STATUS=$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$EXISTING_ID" --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || echo "None")
+              if [ "$SSM_STATUS" = "Online" ]; then
+                echo "Found existing instance ($ROOT_GB GB root, SSM ready): $EXISTING_IP"
+                echo "instance_id=$EXISTING_ID" >> "$GITHUB_OUTPUT"
+                echo "host=$EXISTING_IP" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "Existing instance not in SSM (status=$SSM_STATUS). Terminating for rebuild..."
             else
               echo "Existing instance has only ${ROOT_GB}GB root (need 150+). Terminating for rebuild..."
-              aws ec2 terminate-instances --instance-ids "$EXISTING_ID"
-              echo "Waiting for termination..."
-              aws ec2 wait instance-terminated --instance-ids "$EXISTING_ID"
             fi
+            aws ec2 terminate-instances --instance-ids "$EXISTING_ID"
+            echo "Waiting for termination..."
+            aws ec2 wait instance-terminated --instance-ids "$EXISTING_ID"
           fi
 
           echo "Creating new instance. Ensuring Elastic IP..."
@@ -119,6 +137,7 @@ jobs:
             --image-id "$AWS_AMI_ID" \
             --instance-type g5.xlarge \
             --key-name "$EC2_KEY_PAIR" \
+            --iam-instance-profile "Name=$EC2_IAM_INSTANCE_PROFILE" \
             --security-group-ids "$AWS_SECURITY_GROUP_ID" \
             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME}]" \
             --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=200,VolumeType=gp3}' \
@@ -133,12 +152,17 @@ jobs:
 
           EIP=$(aws ec2 describe-addresses --allocation-ids "$ALLOC_ID" --query 'Addresses[0].PublicIp' --output text)
           echo "Instance ready at $EIP"
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "host=$EIP" >> "$GITHUB_OUTPUT"
 
-          echo "Waiting for SSH..."
-          for j in $(seq 1 24); do
-            nc -z -w 3 "$EIP" 22 2>/dev/null && { echo "SSH ready"; echo "host=$EIP" >> "$GITHUB_OUTPUT"; exit 0; }
-            [ $j -eq 24 ] && { echo "Timeout waiting for SSH"; exit 1; }
-            sleep 5
+          echo "Waiting for SSM agent..."
+          for j in $(seq 1 36); do
+            if aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$INSTANCE_ID" --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null | grep -q "Online"; then
+              echo "SSM agent ready"
+              exit 0
+            fi
+            [ $j -eq 36 ] && { echo "Timeout waiting for SSM agent"; exit 1; }
+            sleep 10
           done
 
   deploy:
@@ -148,96 +172,78 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Copy deploy files to EC2
-        env:
-          EC2_HOST: ${{ needs.ensure-instance.outputs.host }}
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new deploy/docker-compose.yml deploy/.env.example deploy/run-vllm.sh "ubuntu@$EC2_HOST:~/deploy/"
-
-      - name: SSH Deploy
-        uses: appleboy/ssh-action@v1.0.3
-        env:
-          HF_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          host: ${{ needs.ensure-instance.outputs.host }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script_stop: true
-          command_timeout: 30m
-          script: |
-            set -e
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-            NEED_APT=false
-            if ! command -v docker >/dev/null 2>&1; then NEED_APT=true; fi
-            if [ "$NEED_APT" = true ]; then
-              echo "=== Install Docker ==="
-              sudo apt-get update -y
-              sudo apt-get install -y ca-certificates curl gnupg
-              sudo install -m 0755 -d /etc/apt/keyrings
-              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-              sudo apt-get update -y
-              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-              sudo usermod -aG docker ubuntu || true
-            fi
+      - name: Upload deploy files to S3
+        env:
+          DEPLOY_BUCKET: ${{ vars.DEPLOY_BUCKET }}
+        run: |
+          if [ -z "$DEPLOY_BUCKET" ]; then
+            echo "ERROR: DEPLOY_BUCKET is required. Set it in repo vars."
+            exit 1
+          fi
+          aws s3 sync deploy/ "s3://$DEPLOY_BUCKET/deploy/" --exclude ".env" --delete
+          echo "Deploy files synced to s3://$DEPLOY_BUCKET/deploy/"
 
-            if ! sudo docker info 2>/dev/null | grep -q "Runtimes:.*nvidia"; then
-              echo "=== Install NVIDIA Container Toolkit ==="
-              [ "$NEED_APT" != true ] && sudo apt-get update -y
-              curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-              curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-                sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-                sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-              sudo apt-get update -y
-              sudo apt-get install -y nvidia-container-toolkit
-              sudo nvidia-ctk runtime configure --runtime=docker
-              sudo systemctl restart docker
-            fi
+      - name: SSM Deploy
+        env:
+          INSTANCE_ID: ${{ needs.ensure-instance.outputs.instance_id }}
+          DEPLOY_BUCKET: ${{ vars.DEPLOY_BUCKET }}
+          HF_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          set -e
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "null" ]; then
+            echo "ERROR: No instance_id from ensure-instance"
+            exit 1
+          fi
+          # Build JSON commands: escape HF_TOKEN for remote shell
+          HF_ESC=$(printf '%s' "$HF_TOKEN" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')
+          EXPORT_CMD="export HF_TOKEN=\"$HF_ESC\""
+          DEPLOY_DIR="/home/ubuntu/deploy"
+          COMMANDS=$(jq -n --arg e "$EXPORT_CMD" --arg b "$DEPLOY_BUCKET" --arg d "$DEPLOY_DIR" \
+            '["set -e", $e, "mkdir -p " + $d, ("aws s3 cp s3://" + $b + "/deploy/ " + $d + "/ --recursive"), "chown -R ubuntu:ubuntu " + $d, "cd " + $d, "chmod +x remote-deploy.sh", "bash remote-deploy.sh"]')
+          echo "Sending deploy command via SSM..."
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "{\"commands\":$COMMANDS}" \
+            --timeout-seconds 1800 \
+            --output text \
+            --query 'Command.CommandId')
 
-            echo "=== Free disk space before pull ==="
-            sudo apt-get clean 2>/dev/null || true
-            sudo journalctl --vacuum-time=1h 2>/dev/null || true
-            sudo docker system prune -af 2>/dev/null || true
-
-            echo "=== Prepare deploy directory ==="
-            mkdir -p ~/deploy
-            sudo mkdir -p /opt/models
-            cd ~/deploy
-            if [ ! -f .env ]; then
-              cp .env.example .env
-            fi
-            if [ -n "$HF_TOKEN" ]; then
-              sed -i '/^HUGGING_FACE_HUB_TOKEN=/d' .env
-              printf 'HUGGING_FACE_HUB_TOKEN=%s\n' "$HF_TOKEN" >> .env
-            fi
-
-            echo "=== Deploy vLLM containers ==="
-            sudo docker compose pull
-            sudo docker compose up -d
-
-            echo "=== Waiting for vLLM (models may take 5-15 min to load) ==="
-            sudo docker ps -a
-            for i in $(seq 1 180); do
-              if curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1; then
-                echo "vLLM ready"
-                break
-              fi
-              if [ $((i % 12)) -eq 0 ]; then
-                echo "Still waiting... $((i*5))s"
-                sudo docker ps -a --format "table {{.Names}}\t{{.Status}}" 2>/dev/null || true
-              fi
-              if [ $i -eq 180 ]; then
-                echo "Timeout (15 min). Container status:"
-                sudo docker ps -a
-                sudo docker logs vllm_infer --tail 50 2>&1 || true
+          echo "Waiting for SSM command to complete (up to 30 min)..."
+          for i in $(seq 1 120); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo "Pending")
+            case "$STATUS" in
+              Success)
+                echo "Deploy completed successfully"
+                echo "=== SSM stdout (last 50 lines) ==="
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query 'StandardOutputContent' --output text 2>/dev/null | tail -50
+                echo "=== SSM stderr (last 50 lines) ==="
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query 'StandardErrorContent' --output text 2>/dev/null | tail -50
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                echo "Deploy failed: $STATUS"
+                echo "=== SSM stdout (last 80 lines) ==="
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query 'StandardOutputContent' --output text 2>/dev/null | tail -80
+                echo "=== SSM stderr (last 80 lines) ==="
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query 'StandardErrorContent' --output text 2>/dev/null | tail -80
                 exit 1
-              fi
-              sleep 5
-            done
-
-            echo "=== Done ==="
-            sudo docker logs vllm_infer --tail 5 2>&1 || true
+                ;;
+            esac
+            [ $((i % 4)) -eq 0 ] && echo "Status: $STATUS ($((i*15))s)"
+            sleep 15
+          done
+          echo "Timeout waiting for deploy"
+          echo "=== SSM stdout (last 80 lines) ==="
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query 'StandardOutputContent' --output text 2>/dev/null | tail -80 || true
+          echo "=== SSM stderr (last 80 lines) ==="
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query 'StandardErrorContent' --output text 2>/dev/null | tail -80 || true
+          exit 1
