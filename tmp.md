@@ -1,5 +1,5 @@
 git add .
-git commit -m "repush"
+git commit -m "fix1"
 git push
 
 repush
