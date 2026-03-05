@@ -1,3 +1,3 @@
 git add .
-git commit -m "fix2"
+git commit -m "fix"
 git push
